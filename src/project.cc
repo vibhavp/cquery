@@ -1,5 +1,6 @@
 #include "project.h"
 
+#include "compile_commands_loader.h"
 #include "match.h"
 #include "libclangmm/Utility.h"
 #include "platform.h"
@@ -10,6 +11,7 @@
 #include <doctest/doctest.h>
 #include <loguru.hpp>
 
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -26,222 +28,7 @@ MAKE_REFLECT_STRUCT(CompileCommandsEntry, directory, file, command, args);
 
 namespace {
 
-
-static const char* kBlacklistMulti[] = {
-  "-MF",
-  "-Xclang"
-};
-
-// Blacklisted flags which are always removed from the command line.
-static const char *kBlacklist[] = {
-  "--param",
-  "-M",
-  "-MD",
-  "-MG",
-  "-MM",
-  "-MMD",
-  "-MP",
-  "-MQ",
-  "-MT",
-  "-Og",
-  "-Wa,--32",
-  "-Wa,--64",
-  "-Wl,--incremental-full",
-  "-Wl,--incremental-patch,1",
-  "-Wl,--no-incremental",
-  "-fbuild-session-file=",
-  "-fbuild-session-timestamp=",
-  "-fembed-bitcode",
-  "-fembed-bitcode-marker",
-  "-fmodules-validate-once-per-build-session",
-  "-fno-delete-null-pointer-checks",
-  "-fno-use-linker-plugin"
-  "-fno-var-tracking",
-  "-fno-var-tracking-assignments",
-  "-fno-enforce-eh-specs",
-  "-fvar-tracking",
-  "-fvar-tracking-assignments",
-  "-fvar-tracking-assignments-toggle",
-  "-gcc-toolchain",
-  "-march=",
-  "-masm=",
-  "-mcpu=",
-  "-mfpmath=",
-  "-mtune=",
-  "-s",
-
-  "-B",
-  //"-f",
-  //"-pipe",
-  //"-W",
-  // TODO: make sure we consume includes before stripping all path-like args.
-  "/work/goma/gomacc",
-  "../../third_party/llvm-build/Release+Asserts/bin/clang++",
-  "-Wno-unused-lambda-capture",
-  "/",
-  "..",
-  //"-stdlib=libc++"
-};
-
-// Arguments which are followed by a potentially relative path. We need to make
-// all relative paths absolute, otherwise libclang will not resolve them.
-const char* kPathArgs[] = {
-  "-I",
-  "-iquote",
-  "-isystem",
-  "--sysroot="
-};
-
-const char* kQuoteIncludeArgs[] = {
-  "-iquote"
-};
-const char* kAngleIncludeArgs[] = {
-  "-I",
-  "-isystem"
-};
-
-bool ShouldAddToQuoteIncludes(const std::string& arg) {
-  for (const char* flag_type : kQuoteIncludeArgs) {
-    if (arg == flag_type)
-      return true;
-  }
-  return false;
-}
-bool ShouldAddToAngleIncludes(const std::string& arg) {
-  for (const char* flag_type : kAngleIncludeArgs) {
-    if (StartsWith(arg, flag_type))
-      return true;
-  }
-  return false;
-}
-
-// Returns true if we should use the C, not C++, language spec for the given
-// file.
-bool IsCFile(const std::string& path) {
-  return EndsWith(path, ".c");
-}
-
-Project::Entry GetCompilationEntryFromCompileCommandEntry(
-    std::unordered_set<std::string>& quote_includes, std::unordered_set<std::string>& angle_includes,
-    const std::vector<std::string>& extra_flags, const CompileCommandsEntry& entry) {
-  Project::Entry result;
-  result.filename = NormalizePath(entry.file);
-
-  bool make_next_flag_absolute = false;
-  bool add_next_flag_quote = false;
-  bool add_next_flag_angle = false;
-
-  result.args.reserve(entry.args.size() + extra_flags.size());
-  for (size_t i = 0; i < entry.args.size(); ++i) {
-    std::string arg = entry.args[i];
-
-    // If blacklist skip.
-    if (std::any_of(std::begin(kBlacklistMulti), std::end(kBlacklistMulti), [&arg](const char* value) {
-      return StartsWith(arg, value);
-    })) {
-      ++i;
-      continue;
-    }
-    if (std::any_of(std::begin(kBlacklist), std::end(kBlacklist), [&arg](const char* value) {
-      return StartsWith(arg, value);
-    })) {
-      continue;
-    }
-
-    // Cleanup path for previous argument.
-    if (make_next_flag_absolute) {
-      if (arg.size() > 0 && arg[0] != '/')
-        arg = NormalizePath(entry.directory + arg);
-      make_next_flag_absolute = false;
-      
-      if (add_next_flag_quote)
-        quote_includes.insert(arg);
-      if (add_next_flag_angle)
-        angle_includes.insert(arg);
-      add_next_flag_quote = false;
-      add_next_flag_angle = false;
-    }
-
-    // Update arg if it is a path.
-    for (const char* flag_type : kPathArgs) {
-      if (arg == flag_type) {
-        make_next_flag_absolute = true;
-        add_next_flag_quote = ShouldAddToQuoteIncludes(arg);
-        add_next_flag_angle = ShouldAddToAngleIncludes(arg);
-        break;
-      }
-
-      if (StartsWith(arg, flag_type)) {
-        std::string path = arg.substr(strlen(flag_type));
-        if (path.size() > 0 && path[0] != '/') {
-          if (!entry.directory.empty())
-            path = entry.directory + "/" + path;
-          path = NormalizePath(path);
-
-          arg = flag_type + path;
-        }
-        if (ShouldAddToQuoteIncludes(arg))
-          quote_includes.insert(path);
-        if (ShouldAddToAngleIncludes(arg))
-          angle_includes.insert(path);
-        break;
-      }
-    }
-
-    result.args.push_back(arg);
-  }
-
-  // We don't do any special processing on user-given extra flags.
-  for (const auto& flag : extra_flags)
-    result.args.push_back(flag);
-
-  // Clang does not have good hueristics for determining source language, we
-  // should explicitly specify it.
-  if (!AnyStartsWith(result.args, "-x")) {
-    if (IsCFile(entry.file))
-      result.args.push_back("-xc");
-    else
-      result.args.push_back("-xc++");
-  }
-  if (!AnyStartsWith(result.args, "-std=")) {
-    if (IsCFile(entry.file))
-      result.args.push_back("-std=c11");
-    else
-      result.args.push_back("-std=c++11");
-  }
-
-  return result;
-}
-
-/* TODO: Fix this function, it may be way faster than libclang's implementation.
-std::vector<Project::Entry> LoadFromCompileCommandsJson(
-    std::unordered_set<std::string>& quote_includes, std::unordered_set<std::string>& angle_includes,
-    const std::vector<std::string>& extra_flags, const std::string& project_directory) {
-
-  optional<std::string> compile_commands_content = ReadContent(project_directory + "/compile_commands.json");
-  if (!compile_commands_content)
-    return {};
-
-  rapidjson::Document reader;
-  reader.Parse(compile_commands_content->c_str());
-  if (reader.HasParseError())
-    return {};
-
-  std::vector<CompileCommandsEntry> entries;
-  Reflect(reader, entries);
-
-  std::vector<Project::Entry> result;
-  result.reserve(entries.size());
-  for (auto& entry : entries) {
-    if (entry.args.empty() && !entry.command.empty())
-      entry.args = SplitString(entry.command, " ");
-
-    result.push_back(GetCompilationEntryFromCompileCommandEntry(quote_includes, angle_includes, extra_flags, entry));
-  }
-  return result;
-}
-*/
-
+#if false
 std::vector<Project::Entry> LoadFromDirectoryListing(
     std::unordered_set<std::string>& quote_includes, std::unordered_set<std::string>& angle_includes,
     const std::vector<std::string>& extra_flags, const std::string& project_directory) {
@@ -266,7 +53,7 @@ std::vector<Project::Entry> LoadFromDirectoryListing(
       CompileCommandsEntry e;
       e.file = NormalizePath(file);
       e.args = args;
-      result.push_back(GetCompilationEntryFromCompileCommandEntry(quote_includes, angle_includes, extra_flags, e));
+      result.push_back(GetCompilationEntryFromCompileCommandEntry(quote_includes, angle_includes, extra_flags, e.file, e.directory, e.args));
     }
   }
 
@@ -307,7 +94,7 @@ std::vector<Project::Entry> LoadCompilationEntriesFromDirectory(
     for (unsigned j = 0; j < num_args; ++j)
       entry.args.push_back(clang::ToString(clang_CompileCommand_getArg(cx_command, j)));
 
-    result.push_back(GetCompilationEntryFromCompileCommandEntry(quote_includes, angle_includes, extra_flags, entry));
+    result.push_back(GetCompilationEntryFromCompileCommandEntry(quote_includes, angle_includes, extra_flags, entry.file, entry.directory, entry.args));
   }
 
   clang_CompileCommands_dispose(cx_commands);
@@ -315,6 +102,7 @@ std::vector<Project::Entry> LoadCompilationEntriesFromDirectory(
 
   return result;
 }
+#endif
 
 // Computes a score based on how well |a| and |b| match. This is used for
 // argument guessing.
@@ -354,17 +142,46 @@ int ComputeGuessScore(const std::string& a, const std::string& b) {
   return score;
 }
 
+void WriteEntriesToDisk(const std::vector<Project::Entry>& entries) {
+#if false
+  std::ofstream file;
+  file.open("C:/Users/jacob/Desktop/cquery/foo/project.txt");
+  assert(file.good());
+  for (const Project::Entry& entry : entries)
+    file << entry.filename << ": " << StringJoin(entry.args) << std::endl;
+  file.close();
+#endif
+}
+
 }  // namespace
 
-void Project::Load(const std::vector<std::string>& extra_flags, const std::string& directory) {
+void Project::Load(const std::vector<std::string>& extra_flags, const std::string& project_directory) {
   std::unordered_set<std::string> unique_quote_includes;
   std::unordered_set<std::string> unique_angle_includes;
 
-  entries = LoadCompilationEntriesFromDirectory(unique_quote_includes, unique_angle_includes, extra_flags, directory);
+  //std::this_thread::sleep_for(std::chrono::seconds(5));
 
+  // Load the project, using either compile_commands.json or a recursive directory listing.
+  bool loaded_from_compile_commands = false;
+  optional<std::string> compile_commands_content = ReadContent(project_directory + "/compile_commands.json");
+  if (compile_commands_content) {
+    loaded_from_compile_commands = TryLoadFromCompileCommandsJson(
+        &entries,
+        &unique_angle_includes, &unique_quote_includes,
+        project_directory, extra_flags,
+        *compile_commands_content);
+  }
+  if (!loaded_from_compile_commands) {
+    LoadFromDirectoryListing(
+        &entries,
+        &unique_angle_includes, &unique_quote_includes,
+        project_directory, extra_flags);
+  }
+  LOG_S(INFO) << "Finished loading project spec (used compile_commands=" << loaded_from_compile_commands << "); got " << entries.size() << " entries";
+
+  // Project is loaded. Setup include directories.
   quote_include_directories.assign(unique_quote_includes.begin(), unique_quote_includes.end());
   angle_include_directories.assign(unique_angle_includes.begin(), unique_angle_includes.end());
-
   for (std::string& path : quote_include_directories) {
     EnsureEndsInSlash(path);
     LOG_S(INFO) << "quote_include_dir: " << path;
@@ -377,6 +194,8 @@ void Project::Load(const std::vector<std::string>& extra_flags, const std::strin
   absolute_path_to_entry_index_.resize(entries.size());
   for (int i = 0; i < entries.size(); ++i)
     absolute_path_to_entry_index_[entries[i].filename] = i;
+
+  WriteEntriesToDisk(entries);
 }
 
 Project::Entry Project::FindCompilationEntryForFile(const std::string& filename) {

@@ -2953,8 +2953,8 @@ int main(int argc, char** argv) {
     if (context.shouldExit())
       return res;
 
-    for (int i = 0; i < 1; ++i)
-      RunTests();
+    //for (int i = 0; i < 1; ++i)
+    //  RunTests();
 
     /*
     for (int i = 0; i < 1; ++i) {
